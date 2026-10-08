@@ -1,0 +1,15 @@
+{
+  "id": "com.kpk.claude-desktop-update-check",
+  "name": "Claude 更新检查",
+  "version": "0.1.0",
+  "description": "手动查询 Claude Desktop 的可用版本和更新说明，不下载或安装更新。",
+  "author": "KPK",
+  "homepage": "https://github.com/kpkhxlgy0/claude-desktop-update-check",
+  "iconUrl": "./icon.png",
+  "tags": ["updates", "version", "settings"],
+  "githubRepo": "kpkhxlgy0/claude-desktop-update-check",
+  "minRuntime": "0.3.4",
+  "scope": "both",
+  "main": "index.js",
+  "permissions": ["settings", "ipc", "network"]
+}
