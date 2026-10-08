@@ -1,7 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-10-08
 
+- 新增“更新 Claude”和“重启安装”操作，仅在明确点击后调用原生 MSIX 更新器；保留独立的只检查模式。
+- 补齐原生更新状态、重复点击保护和 Tweak 重载后的状态恢复。
+- 图标改为带真实 Alpha 通道的 PNG，并单独配置左侧导航图标。
 - 补充 `Inject-ClaudePlusPlus.ps1` 和 `Uninject-ClaudePlusPlus.ps1`，支持源码开发链接的安装、移除及 `-CheckOnly` 检查。
 - 增加 Windows Junction 安全测试和源码安装说明。
 

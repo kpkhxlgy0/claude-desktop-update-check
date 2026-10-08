@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const { EventEmitter } = require('node:events');
 const { createRequire } = require('node:module');
 const path = require('node:path');
 const test = require('node:test');
@@ -108,15 +109,25 @@ function loadTweak(globals = {}) {
   return context.module.exports;
 }
 
-function rendererFixture(invoke) {
+const idleNativeState = { phase: 'idle', supported: true, message: null, version: null };
+
+function rendererFixture(invoke, readState = async () => idleNativeState) {
   const document = documentFixture();
   const root = document.createElement('div');
   const registrations = [];
+  const subscriptions = new Map();
   let unregisterCount = 0;
   const tweak = loadTweak({ document });
   const api = {
     process: 'renderer',
-    ipc: { invoke },
+    ipc: {
+      invoke: (channel, ...args) => channel === 'get-native-update-state' ? readState() : invoke(channel, ...args),
+      on(channel, listener) {
+        if (!subscriptions.has(channel)) subscriptions.set(channel, new Set());
+        subscriptions.get(channel).add(listener);
+        return () => subscriptions.get(channel).delete(listener);
+      },
+    },
     settings: {
       registerPage(page) {
         registrations.push(page);
@@ -125,26 +136,32 @@ function rendererFixture(invoke) {
     },
   };
   tweak.start(api);
-  return { tweak, root, registrations, unregisterCount: () => unregisterCount };
+  return {
+    tweak, root, registrations, subscriptions, unregisterCount: () => unregisterCount,
+    emit(state) { for (const listener of subscriptions.get('native-update-state') ?? []) listener(state); },
+  };
 }
 
-test('renderer starts without Node require and requests only the local version on render', async () => {
+test('renderer starts without Node require and reads only local version and native state on render', async () => {
   const calls = [];
   const fixture = rendererFixture(async (channel) => {
     calls.push(channel);
     return '2.26454.2.0';
-  });
+  }, async () => { calls.push('get-native-update-state'); return idleNativeState; });
   assert.equal(fixture.registrations.length, 1);
   assert.equal(fixture.registrations[0].id, 'main');
   assert.equal(fixture.registrations[0].title, 'Claude 更新检查');
+  assert.match(fixture.registrations[0].iconSvg, /<svg.*stroke="currentColor"/);
   assert.deepEqual(calls, []);
 
   const cleanup = fixture.registrations[0].render(fixture.root);
   await settle();
-  assert.deepEqual(calls, ['get-version']);
+  assert.deepEqual(calls, ['get-version', 'get-native-update-state']);
   assert.match(fixture.root.textContent, /2\.26454\.2\.0/);
-  assert.match(fixture.root.textContent, /仅查询官方版本信息，不下载或安装更新/);
+  assert.match(fixture.root.textContent, /点击.*更新 Claude.*下载/);
+  assert.match(fixture.root.textContent, /下载完成后.*下次启动.*安装/);
   assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON').textContent, '检查更新（不下载）');
+  assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude').disabled, true);
   assert.equal(find(fixture.root, (node) => node.getAttribute('role') === 'status').getAttribute('aria-live'), 'polite');
   cleanup();
 });
@@ -162,12 +179,14 @@ test('manual checks show newer versions and render untrusted release notes as pl
   const button = find(fixture.root, (node) => node.tagName === 'BUTTON');
   const check = button.click();
   assert.equal(button.disabled, true);
+  assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude').disabled, true);
   await button.click();
   assert.deepEqual(calls, ['get-version', 'check-update']);
 
   pending.resolve({ currentVersion: '2.26454.2.0', latestVersion: '2.30000.0', updateAvailable: true, releaseNotes: notes });
   await check;
   assert.equal(button.disabled, false);
+  assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude').disabled, false);
   assert.match(fixture.root.textContent, /2\.30000\.0/);
   assert.match(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /发现新版本/);
   const renderedNotes = find(fixture.root, (node) => node.tagName === 'PRE');
@@ -207,6 +226,7 @@ test('failed checks reset the button and clear a stale success result before ret
   assert.match(status.textContent, /检查失败/);
   assert.doesNotMatch(status.textContent, /已是最新|发现新版本/);
   assert.doesNotMatch(fixture.root.textContent, /First result|2\.30000\.0/);
+  assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude').disabled, true);
   await button.click();
   assert.equal(checks, 3);
   assert.match(status.textContent, /发现新版本/);
@@ -220,6 +240,7 @@ test('page unmount removes its click listener and ignores late IPC results', asy
   const button = find(fixture.root, (node) => node.tagName === 'BUTTON');
   cleanup();
   assert.equal(button.listeners.get('click').size, 0);
+  assert.equal(fixture.subscriptions.get('native-update-state').size, 0);
   assert.equal(fixture.root.children.length, 0);
   pending.resolve('9.9.9');
   await settle();
@@ -263,12 +284,19 @@ function feedResponse(version = '2.30000.0') {
   }), { status: 200, headers: { 'content-type': 'application/json' } });
 }
 
-function mainFixture(request, values = new Map()) {
+function mainFixture(request, values = new Map(), options = {}) {
   const calls = [];
   const storageReads = [];
   const storageWrites = [];
   const logs = [];
   const handlers = new Map();
+  const nativeCalls = [];
+  const messages = [];
+  const dialogs = [];
+  const autoUpdater = new EventEmitter();
+  autoUpdater.setFeedURL = (options) => nativeCalls.push({ method: 'setFeedURL', options });
+  autoUpdater.checkForUpdates = () => { nativeCalls.push({ method: 'checkForUpdates' }); return options.nativeCheck?.(); };
+  autoUpdater.quitAndInstall = () => nativeCalls.push({ method: 'quitAndInstall' });
   const net = {
     fetch(url, options) {
       assert.equal(this, net, 'Electron net.fetch must preserve its receiver');
@@ -279,12 +307,18 @@ function mainFixture(request, values = new Map()) {
   const nodeRequire = createRequire(entryPath);
   const tweak = loadTweak({
     AbortController,
-    process: { arch: process.arch },
-    require: (name) => name === 'electron' ? { app: { getVersion: () => '2.26454.2.0' }, net } : nodeRequire(name),
+    process: { arch: 'x64', platform: 'win32', windowsStore: options.windowsStore ?? true, versions: { electron: '39.0.0' } },
+    require: (name) => name === 'electron' ? {
+      app: { getVersion: () => '2.26454.2.0' }, net, autoUpdater,
+      dialog: { showMessageBox(dialogOptions) { dialogs.push(dialogOptions); return options.confirm?.() ?? Promise.resolve({ response: 0 }); } },
+    } : nodeRequire(name),
   });
   const api = {
     process: 'main',
-    ipc: { handle(channel, handler) { handlers.set(channel, handler); } },
+    ipc: {
+      handle(channel, handler) { handlers.set(channel, handler); },
+      send(channel, value) { messages.push({ channel, value }); },
+    },
     storage: {
       get(key) { storageReads.push(key); return values.get(key); },
       set(key, value) { storageWrites.push([key, value]); values.set(key, value); },
@@ -292,7 +326,7 @@ function mainFixture(request, values = new Map()) {
     log: { info(...args) { logs.push(args); } },
   };
   tweak.start(api);
-  return { tweak, handlers, calls, storageReads, storageWrites, values, logs };
+  return { tweak, handlers, calls, storageReads, storageWrites, values, logs, nativeCalls, messages, dialogs, autoUpdater };
 }
 
 function mainHandler(fixture, channel) {
@@ -305,10 +339,12 @@ test('Main startup and local version reads never query the network or create an 
   const fixture = mainFixture(() => { throw new Error('Unexpected network request'); });
   assert.equal(await mainHandler(fixture, 'get-version')(), '2.26454.2.0');
   mainHandler(fixture, 'check-update');
+  assert.equal(mainHandler(fixture, 'get-native-update-state')().phase, 'idle');
   await settle();
   assert.equal(fixture.calls.length, 0);
   assert.deepEqual(fixture.storageReads, []);
   assert.deepEqual(fixture.storageWrites, []);
+  assert.deepEqual(fixture.nativeCalls, []);
   assert.match(fixture.logs.flat().join(' '), /2\.26454\.2\.0/);
   fixture.tweak.stop();
 });
@@ -416,5 +452,396 @@ test('the official placeholder for empty release notes is explained without inve
   await find(fixture.root, (node) => node.tagName === 'BUTTON').click();
   assert.match(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /当前版本无需更新/);
   assert.equal(find(fixture.root, (node) => node.tagName === 'PRE').textContent, '官方接口未提供详细更新说明。');
+  fixture.tweak.stop();
+});
+
+test('only an explicit update click starts native work and native events keep both actions disabled', async () => {
+  const calls = [];
+  const fixture = rendererFixture(async (channel) => {
+    calls.push(channel);
+    if (channel === 'get-version') return '2.26454.2.0';
+    if (channel === 'check-update') return { currentVersion: '2.26454.2.0', latestVersion: '2.30000.0', updateAvailable: true, releaseNotes: null };
+    if (channel === 'start-native-update') return { ...idleNativeState, phase: 'checking' };
+    throw new Error(`Unexpected invocation ${channel}`);
+  });
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  const check = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新'));
+  const update = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude');
+  await check.click();
+  assert.deepEqual(calls, ['get-version', 'check-update']);
+  await update.click();
+  assert.deepEqual(calls, ['get-version', 'check-update', 'start-native-update']);
+  assert.equal(check.disabled, true);
+  assert.equal(update.disabled, true);
+  assert.match(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /检查|查询/);
+  fixture.emit({ ...idleNativeState, phase: 'downloading' });
+  assert.match(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /下载/);
+  const progress = find(fixture.root, (node) => node.tagName === 'PROGRESS');
+  assert.equal(progress.hidden, false);
+  assert.equal(progress.getAttribute('value'), null, 'No percentage is invented for native events');
+  await check.click();
+  await update.click();
+  assert.equal(calls.length, 3);
+  fixture.emit({ ...idleNativeState, phase: 'ready', version: '2.30000.0' });
+  assert.equal(update.textContent, '重启安装');
+  assert.equal(update.disabled, false);
+  assert.equal(progress.hidden, true);
+  fixture.tweak.stop();
+});
+
+test('a page opened after download offers only the explicit restart action', async () => {
+  const calls = [];
+  const ready = { ...idleNativeState, phase: 'ready', version: '2.30000.0' };
+  const fixture = rendererFixture(async (channel) => {
+    calls.push(channel);
+    if (channel === 'get-version') return '2.26454.2.0';
+    if (channel === 'restart-native-update') return ready;
+    throw new Error(`Unexpected invocation ${channel}`);
+  }, async () => ready);
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  assert.deepEqual(calls, ['get-version']);
+  const update = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '重启安装');
+  assert.equal(update.disabled, false);
+  assert.match(fixture.root.textContent, /2\.30000\.0/);
+  await update.click();
+  assert.deepEqual(calls, ['get-version', 'restart-native-update']);
+  assert.equal(update.disabled, false, 'Cancelling confirmation retains the restart action');
+  fixture.emit({ ...ready, phase: 'restarting' });
+  assert.equal(update.disabled, true);
+  assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新')).disabled, true);
+  fixture.tweak.stop();
+});
+
+test('confirmation waiting disables both actions without claiming installation has started', async () => {
+  const ready = { ...idleNativeState, phase: 'ready', version: '2.30000.0' };
+  const fixture = rendererFixture(async (channel) => {
+    if (channel === 'get-version') return '2.26454.2.0';
+    assert.equal(channel, 'restart-native-update');
+    return { ...ready, phase: 'confirming' };
+  }, async () => ready);
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  const update = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '重启安装');
+  const check = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新'));
+  await update.click();
+  assert.equal(update.disabled, true);
+  assert.equal(check.disabled, true);
+  assert.match(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /确认对话框/);
+  assert.doesNotMatch(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /正在重启|安装更新/);
+  fixture.emit(ready);
+  assert.equal(update.textContent, '重启安装');
+  assert.equal(update.disabled, false);
+  fixture.tweak.stop();
+});
+
+test('unsupported native updates show the reason even after metadata finds a newer version', async () => {
+  const reason = '<img src=x onerror=alert(1)> 当前安装方式不支持原生更新';
+  const fixture = rendererFixture(async (channel) => channel === 'get-version' ? '2.26454.2.0' : {
+    currentVersion: '2.26454.2.0', latestVersion: '2.30000.0', updateAvailable: true, releaseNotes: null,
+  }, async () => ({ phase: 'unavailable', supported: false, message: reason, version: null }));
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  await find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新')).click();
+  assert.match(fixture.root.textContent, /发现新版本/);
+  assert.ok(fixture.root.textContent.includes(reason));
+  assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude').disabled, true);
+  fixture.tweak.stop();
+});
+
+test('late state reads and action snapshots cannot overwrite newer native event state', async () => {
+  const initial = deferred();
+  const start = deferred();
+  const fixture = rendererFixture(async (channel) => {
+    if (channel === 'get-version') return '2.26454.2.0';
+    if (channel === 'check-update') return { currentVersion: '2.26454.2.0', latestVersion: '2.30000.0', updateAvailable: true, releaseNotes: null };
+    if (channel === 'start-native-update') return start.promise;
+    throw new Error(`Unexpected invocation ${channel}`);
+  }, () => initial.promise);
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  fixture.emit(idleNativeState);
+  await find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新')).click();
+  const update = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude');
+  const click = update.click();
+  fixture.emit({ ...idleNativeState, phase: 'ready', version: '2.30000.0' });
+  initial.resolve(idleNativeState);
+  start.resolve({ ...idleNativeState, phase: 'checking' });
+  await click;
+  await settle();
+  assert.equal(update.textContent, '重启安装');
+  assert.equal(update.disabled, false);
+  fixture.tweak.stop();
+});
+
+test('finishing a metadata check cannot unlock actions while a native download is active', async () => {
+  const metadata = deferred();
+  const fixture = rendererFixture(async (channel) => channel === 'get-version' ? '2.26454.2.0' : metadata.promise);
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  const check = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新'));
+  const update = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude');
+  const checking = check.click();
+  fixture.emit({ ...idleNativeState, phase: 'downloading' });
+  metadata.resolve({ currentVersion: '2.26454.2.0', latestVersion: '2.30000.0', updateAvailable: true, releaseNotes: null });
+  await checking;
+  assert.equal(check.disabled, true);
+  assert.equal(update.disabled, true);
+  assert.match(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /下载/);
+  fixture.tweak.stop();
+});
+
+test('all open views share native updates and one view cleanup leaves the other subscribed', async () => {
+  const fixture = rendererFixture(async (channel) => {
+    assert.equal(channel, 'get-version');
+    return '2.26454.2.0';
+  });
+  const cleanup = fixture.registrations[0].render(fixture.root);
+  const second = fixture.root.ownerDocument.createElement('div');
+  fixture.registrations[0].render(second);
+  await settle();
+  fixture.emit({ ...idleNativeState, phase: 'downloading' });
+  for (const root of [fixture.root, second]) {
+    assert.equal(find(root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新')).disabled, true);
+    assert.match(find(root, (node) => node.getAttribute('role') === 'status').textContent, /下载/);
+  }
+  cleanup();
+  fixture.emit({ ...idleNativeState, phase: 'ready', version: '2.30000.0' });
+  assert.equal(fixture.root.children.length, 0);
+  assert.equal(find(second, (node) => node.tagName === 'BUTTON' && node.textContent === '重启安装').disabled, false);
+  assert.equal(fixture.subscriptions.get('native-update-state').size, 1);
+  fixture.tweak.stop();
+});
+
+test('native errors are plain text and leave manual retry available only with a newer metadata result', async () => {
+  const reason = '<script>throw Error()</script> 下载失败';
+  const fixture = rendererFixture(async (channel) => {
+    if (channel === 'get-version') return '2.26454.2.0';
+    if (channel === 'check-update') return { currentVersion: '2.26454.2.0', latestVersion: '2.30000.0', updateAvailable: true, releaseNotes: null };
+    throw new Error(reason);
+  });
+  const cleanup = fixture.registrations[0].render(fixture.root);
+  await settle();
+  const check = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新'));
+  const update = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude');
+  await check.click();
+  await update.click();
+  assert.ok(fixture.root.textContent.includes(reason));
+  assert.equal(update.disabled, false);
+  const status = find(fixture.root, (node) => node.getAttribute('role') === 'status');
+  const before = status.textContent;
+  cleanup();
+  fixture.emit({ ...idleNativeState, phase: 'downloading' });
+  assert.equal(status.textContent, before);
+  assert.equal(update.listeners.get('click').size, 0);
+  assert.equal(fixture.subscriptions.get('native-update-state').size, 0);
+  assert.equal(fixture.root.children.length, 0);
+  fixture.tweak.stop();
+});
+
+test('a later manual metadata check replaces an idle native no-update message with its own result or failure', async () => {
+  const metadata = deferred();
+  let attempts = 0;
+  const fixture = rendererFixture(async (channel) => {
+    if (channel === 'get-version') return '2.26454.2.0';
+    assert.equal(channel, 'check-update');
+    attempts += 1;
+    if (attempts === 1) return metadata.promise;
+    throw new Error('Offline');
+  });
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  const check = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新'));
+  const update = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude');
+  const status = find(fixture.root, (node) => node.getAttribute('role') === 'status');
+  fixture.emit({ ...idleNativeState, message: '当前版本无需更新。' });
+  assert.match(status.textContent, /无需更新/);
+  const checking = check.click();
+  assert.match(status.textContent, /正在查询/);
+  metadata.resolve({ currentVersion: '2.26454.2.0', latestVersion: '2.30000.0', updateAvailable: true, releaseNotes: null });
+  await checking;
+  assert.match(status.textContent, /发现新版本/);
+  assert.doesNotMatch(status.textContent, /无需更新/);
+  assert.equal(update.disabled, false);
+  await check.click();
+  assert.match(status.textContent, /检查失败/);
+  assert.doesNotMatch(status.textContent, /无需更新/);
+  assert.equal(update.disabled, true);
+  fixture.tweak.stop();
+});
+
+test('a manual metadata result replaces an earlier native error and a fresh native error remains visible', async () => {
+  const metadata = deferred();
+  const fixture = rendererFixture(async (channel) => channel === 'get-version' ? '2.26454.2.0' : metadata.promise);
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  fixture.emit({ ...idleNativeState, phase: 'error', message: '上次下载失败。' });
+  const status = find(fixture.root, (node) => node.getAttribute('role') === 'status');
+  assert.match(status.textContent, /上次下载失败/);
+  const checking = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新')).click();
+  assert.match(status.textContent, /正在查询/);
+  metadata.resolve({ currentVersion: '2.26454.2.0', latestVersion: '2.30000.0', updateAvailable: true, releaseNotes: null });
+  await checking;
+  assert.match(status.textContent, /发现新版本/);
+  assert.doesNotMatch(status.textContent, /上次下载失败/);
+  assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude').disabled, false);
+  fixture.emit({ ...idleNativeState, phase: 'error', message: '新的下载错误。' });
+  assert.match(status.textContent, /新的下载错误/);
+  fixture.tweak.stop();
+});
+
+test('a failed manual metadata check replaces an earlier native error and disables update', async () => {
+  const metadata = deferred();
+  const fixture = rendererFixture(async (channel) => channel === 'get-version' ? '2.26454.2.0' : metadata.promise);
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  fixture.emit({ ...idleNativeState, phase: 'error', message: '上次下载失败。' });
+  const status = find(fixture.root, (node) => node.getAttribute('role') === 'status');
+  const checking = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新')).click();
+  assert.match(status.textContent, /正在查询/);
+  metadata.reject(new Error('Offline'));
+  await checking;
+  assert.match(status.textContent, /检查失败/);
+  assert.doesNotMatch(status.textContent, /上次下载失败/);
+  assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude').disabled, true);
+  assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新')).disabled, false);
+  fixture.tweak.stop();
+});
+
+test('a late initial idle snapshot preserves the newer manual metadata result', async () => {
+  const initial = deferred();
+  const fixture = rendererFixture(async (channel) => channel === 'get-version' ? '2.26454.2.0' : {
+    currentVersion: '2.26454.2.0', latestVersion: '2.30000.0', updateAvailable: true, releaseNotes: null,
+  }, () => initial.promise);
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  await find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新')).click();
+  initial.resolve({ ...idleNativeState, message: '当前版本无需更新。' });
+  await settle();
+  const status = find(fixture.root, (node) => node.getAttribute('role') === 'status');
+  assert.match(status.textContent, /发现新版本/);
+  assert.doesNotMatch(status.textContent, /无需更新/);
+  assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude').disabled, false);
+  fixture.tweak.stop();
+});
+
+test('a late initial error snapshot preserves the completed manual metadata result', async () => {
+  const initial = deferred();
+  const fixture = rendererFixture(async (channel) => channel === 'get-version' ? '2.26454.2.0' : {
+    currentVersion: '2.26454.2.0', latestVersion: '2.30000.0', updateAvailable: true, releaseNotes: null,
+  }, () => initial.promise);
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  await find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新')).click();
+  initial.resolve({ ...idleNativeState, phase: 'error', message: '上次下载失败。' });
+  await settle();
+  const status = find(fixture.root, (node) => node.getAttribute('role') === 'status');
+  assert.match(status.textContent, /发现新版本/);
+  assert.doesNotMatch(status.textContent, /上次下载失败/);
+  assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude').disabled, false);
+  fixture.emit({ ...idleNativeState, phase: 'error', message: '新的下载错误。' });
+  assert.match(status.textContent, /新的下载错误/);
+  fixture.tweak.stop();
+});
+
+test('Main rejects native start until a successful current metadata result is newer', async () => {
+  let response = feedResponse('2.26454.2');
+  const fixture = mainFixture(async () => response);
+  const start = mainHandler(fixture, 'start-native-update');
+  assert.throws(() => start('https://example.invalid/feed', '99.0.0'), /检查|新版本/);
+  await mainHandler(fixture, 'check-update')();
+  assert.throws(() => start(), /检查|新版本/);
+  assert.deepEqual(fixture.nativeCalls, []);
+  response = feedResponse();
+  await mainHandler(fixture, 'check-update')();
+  const state = start('https://example.invalid/feed', '99.0.0');
+  assert.equal(state.phase, 'checking');
+  assert.deepEqual(fixture.nativeCalls.map((call) => call.method), ['setFeedURL', 'checkForUpdates']);
+  const nativeUrl = new URL(fixture.nativeCalls[0].options.url);
+  assert.equal(nativeUrl.origin, 'https://api.anthropic.com');
+  assert.equal(nativeUrl.pathname, '/api/desktop/win32/x64/msix/update');
+  assert.equal(nativeUrl.searchParams.get('version'), '2.26454.2.0');
+  assert.equal(nativeUrl.searchParams.get('device_id'), fixture.values.get('deviceId'));
+  assert.equal(fixture.storageWrites.length, 1);
+  assert.equal(mainHandler(fixture, 'start-native-update')().phase, 'checking');
+  assert.equal(fixture.nativeCalls.length, 2);
+  assert.throws(() => mainHandler(fixture, 'check-update')(), /正在|等待|更新/);
+  fixture.autoUpdater.emit('update-available');
+  assert.equal(mainHandler(fixture, 'get-native-update-state')().phase, 'downloading');
+  assert.equal(fixture.messages.at(-1).channel, 'native-update-state');
+  assert.equal(fixture.messages.at(-1).value.phase, 'downloading');
+  fixture.autoUpdater.emit('update-downloaded', {}, 'Release notes', '2.30000.0', new Date(), 'https://example.invalid/ignored');
+  assert.equal(mainHandler(fixture, 'start-native-update')().phase, 'ready');
+  assert.equal(fixture.nativeCalls.length, 2, 'A downloaded update must not download again');
+  fixture.tweak.stop();
+});
+
+test('Main clears stale metadata eligibility when rechecking and after failure', async () => {
+  const pending = deferred();
+  let attempts = 0;
+  const fixture = mainFixture(() => { attempts += 1; return attempts === 1 ? feedResponse() : pending.promise; });
+  await mainHandler(fixture, 'check-update')();
+  const checking = mainHandler(fixture, 'check-update')();
+  assert.throws(() => mainHandler(fixture, 'start-native-update')(), /检查|新版本/);
+  pending.reject(new Error('Offline'));
+  await assert.rejects(checking, /Offline/);
+  assert.throws(() => mainHandler(fixture, 'start-native-update')(), /检查|新版本/);
+  assert.deepEqual(fixture.nativeCalls, []);
+  fixture.tweak.stop();
+});
+
+test('Main native restart requires a cancel-default dialog and ignores confirmation after stop', async () => {
+  const confirmation = deferred();
+  const fixture = mainFixture(async () => feedResponse(), new Map(), { confirm: () => confirmation.promise });
+  await mainHandler(fixture, 'check-update')();
+  mainHandler(fixture, 'start-native-update')();
+  fixture.autoUpdater.emit('update-downloaded', {}, '', '2.30000.0');
+  const restart = mainHandler(fixture, 'restart-native-update');
+  const acknowledgement = restart();
+  assert.equal(typeof acknowledgement.then, 'undefined', 'The IPC reply must not wait for the user dialog');
+  assert.equal(acknowledgement.phase, 'confirming');
+  assert.throws(() => mainHandler(fixture, 'check-update')(), /正在|等待|更新/);
+  await settle();
+  assert.equal(fixture.dialogs.length, 1);
+  const dialog = fixture.dialogs[0];
+  assert.deepEqual([...dialog.buttons], ['取消', '重启并安装']);
+  assert.equal(dialog.defaultId, 0);
+  assert.equal(dialog.cancelId, 0);
+  assert.match(`${dialog.message} ${dialog.detail}`, /关闭.*Claude.*窗口/);
+  assert.match(`${dialog.message} ${dialog.detail}`, /任务/);
+  assert.match(`${dialog.message} ${dialog.detail}`, /下次|下一次/);
+  fixture.tweak.stop();
+  const messageCount = fixture.messages.length;
+  confirmation.resolve({ response: 1 });
+  await settle();
+  assert.equal(fixture.nativeCalls.filter((call) => call.method === 'quitAndInstall').length, 0);
+  fixture.autoUpdater.emit('update-downloaded', {}, '', '2.40000.0');
+  assert.equal(fixture.messages.length, messageCount);
+  for (const channel of ['get-native-update-state', 'start-native-update', 'restart-native-update']) {
+    assert.throws(() => mainHandler(fixture, channel)(), /stopped|停止|停用/i);
+  }
+});
+
+test('Main cancel keeps downloaded state and explicit confirmation calls install once', async () => {
+  let response = 0;
+  const fixture = mainFixture(async () => feedResponse(), new Map(), { confirm: async () => ({ response }) });
+  await mainHandler(fixture, 'check-update')();
+  mainHandler(fixture, 'start-native-update')();
+  fixture.autoUpdater.emit('update-downloaded', {}, '', '2.30000.0');
+  const restart = mainHandler(fixture, 'restart-native-update');
+  assert.equal(restart().phase, 'confirming');
+  await settle();
+  assert.equal(mainHandler(fixture, 'get-native-update-state')().phase, 'ready');
+  assert.equal(fixture.nativeCalls.filter((call) => call.method === 'quitAndInstall').length, 0);
+  response = 1;
+  const first = restart();
+  const second = restart();
+  assert.equal(first.phase, 'confirming');
+  assert.equal(second.phase, 'confirming');
+  await settle();
+  assert.equal(mainHandler(fixture, 'get-native-update-state')().phase, 'restarting');
+  assert.equal(fixture.dialogs.length, 2);
+  assert.equal(fixture.nativeCalls.filter((call) => call.method === 'quitAndInstall').length, 1);
   fixture.tweak.stop();
 });

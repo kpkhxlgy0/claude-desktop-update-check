@@ -1,6 +1,6 @@
 {
   "name": "claude-desktop-update-check",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "license": "MIT",
   "repository": {
@@ -8,7 +8,7 @@
     "url": "https://github.com/kpkhxlgy0/claude-desktop-update-check.git"
   },
   "type": "commonjs",
-  "description": "Manual metadata-only Claude Desktop update checks for Claude++.",
+  "description": "Manual Claude Desktop version checks and opt-in native updates for Claude++.",
   "scripts": {
     "test": "node --test test/*.test.cjs",
     "test:windows": "pwsh -NoProfile -File scripts/test/TweakLink.Tests.ps1"
