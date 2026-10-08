@@ -10,7 +10,8 @@
   "type": "commonjs",
   "description": "Manual metadata-only Claude Desktop update checks for Claude++.",
   "scripts": {
-    "test": "node --test test/*.test.cjs"
+    "test": "node --test test/*.test.cjs",
+    "test:windows": "pwsh -NoProfile -File scripts/test/TweakLink.Tests.ps1"
   },
   "engines": { "node": ">=24" }
 }

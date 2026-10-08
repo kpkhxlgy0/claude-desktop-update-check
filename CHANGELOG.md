@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- 补充 `Inject-ClaudePlusPlus.ps1` 和 `Uninject-ClaudePlusPlus.ps1`，支持源码开发链接的安装、移除及 `-CheckOnly` 检查。
+- 增加 Windows Junction 安全测试和源码安装说明。
+
 ## 0.1.1 — 2026-10-08
 
 - 将图标打包为 256 × 256 PNG，满足 Claude++ 本地图标的 1 MiB 大小限制。
