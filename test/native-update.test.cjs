@@ -45,14 +45,15 @@ test("opening and reading the controller never starts native update work or crea
   const controller = create(updater, {
     getDeviceId() { assert.fail("rollout ID must be deferred until Update"); },
     confirmRestart() { assert.fail("restart confirmation must be explicit"); },
+    now() { assert.fail("elapsed time must not begin before Update"); },
   });
   assert.deepEqual(controller.getState(), {
-    phase: "idle", supported: true, message: null, version: null,
+    phase: "idle", supported: true, message: null, version: null, startedAt: null,
   });
   const snapshot = controller.getState();
   snapshot.phase = "ready";
   assert.equal(controller.getState().phase, "idle");
-  assert.equal(JSON.stringify(controller.getState()), '{"phase":"idle","supported":true,"message":null,"version":null}');
+  assert.equal(JSON.stringify(controller.getState()), '{"phase":"idle","supported":true,"message":null,"version":null,"startedAt":null}');
   assert.deepEqual(updater.calls, []);
   assert.deepEqual(updater.eventNames(), []);
   controller.dispose();
@@ -119,8 +120,13 @@ for (const options of [
 ]) {
   test(`fails closed for an unavailable Windows MSIX updater: ${JSON.stringify(options)}`, async () => {
     const updater = nativeUpdater();
-    const controller = create(updater, { ...options, getDeviceId() { assert.fail("unsupported updater must not create an ID"); } });
+    const controller = create(updater, {
+      ...options,
+      getDeviceId() { assert.fail("unsupported updater must not create an ID"); },
+      now() { assert.fail("unsupported updater must not start elapsed time"); },
+    });
     assert.equal(controller.getState().supported, false);
+    assert.equal(controller.getState().startedAt, null);
     assert.equal(controller.start().phase, "unavailable");
     assert.equal((await controller.restart()).phase, "unavailable");
     assert.deepEqual(updater.calls, []);
@@ -530,3 +536,133 @@ for (const reloadWhilePending of [false, true]) {
     assert.deepEqual(updater.eventNames(), ["error"]);
   });
 }
+
+test("one fresh Update timestamp survives native phases, confirmation, and restart", async () => {
+  const updater = nativeUpdater();
+  const changes = [];
+  let clockReads = 0;
+  const controller = create(updater, {
+    now() { clockReads++; return 1791424800000; },
+    confirmRestart: async () => true,
+    onChange: (state) => changes.push(state),
+  });
+  assert.equal(controller.start().startedAt, 1791424800000);
+  assert.equal(controller.start().startedAt, 1791424800000);
+  updater.emit("update-available");
+  assert.equal(controller.start().startedAt, 1791424800000);
+  downloaded(updater);
+  controller.start();
+  const restart = controller.restart();
+  controller.start();
+  assert.equal((await restart).startedAt, 1791424800000);
+  assert.equal(clockReads, 1);
+  assert.deepEqual(changes.map(({ phase, startedAt }) => ({ phase, startedAt })), [
+    { phase: "checking", startedAt: 1791424800000 },
+    { phase: "downloading", startedAt: 1791424800000 },
+    { phase: "ready", startedAt: 1791424800000 },
+    { phase: "confirming", startedAt: 1791424800000 },
+    { phase: "restarting", startedAt: 1791424800000 },
+  ]);
+  assert.equal(JSON.parse(JSON.stringify(controller.getState())).startedAt, 1791424800000);
+  controller.dispose();
+});
+
+test("explicit retries replace the attempt timestamp while errors and no-update retain it", () => {
+  const updater = nativeUpdater();
+  const times = [1791424800000, 1791424860000, 1791424920000];
+  const changes = [];
+  const controller = create(updater, {
+    now: () => times.shift(),
+    onChange: (state) => changes.push([state.phase, state.startedAt]),
+  });
+  controller.start();
+  updater.emit("error", new Error("Temporary download failure"));
+  assert.equal(controller.getState().startedAt, 1791424800000);
+  assert.equal(controller.start().startedAt, 1791424860000);
+  updater.emit("update-not-available");
+  assert.equal(controller.getState().startedAt, 1791424860000);
+  assert.equal(controller.start().startedAt, 1791424920000);
+  assert.deepEqual(changes, [
+    ["checking", 1791424800000], ["error", 1791424800000],
+    ["checking", 1791424860000], ["idle", 1791424860000],
+    ["checking", 1791424920000],
+  ]);
+  updater.emit("update-not-available");
+  controller.dispose();
+});
+
+test("a shared timestamp survives lease and require-cache reload without reading another clock", () => {
+  const updater = nativeUpdater();
+  const first = create(updater, { now: () => 1791424800000 });
+  first.start();
+  first.dispose();
+  const modulePath = require.resolve("../native-update.cjs");
+  delete require.cache[modulePath];
+  const changes = [];
+  const reloaded = require("../native-update.cjs").createNativeUpdateController({
+    ...baseOptions, autoUpdater: updater,
+    now() { assert.fail("reload must not fabricate a new attempt time"); },
+    onChange: (state) => changes.push(state.startedAt),
+  });
+  assert.equal(reloaded.getState().startedAt, 1791424800000);
+  assert.equal(reloaded.start().startedAt, 1791424800000);
+  updater.emit("update-available");
+  downloaded(updater);
+  assert.equal(reloaded.getState().startedAt, 1791424800000);
+  assert.deepEqual(changes, [1791424800000, 1791424800000]);
+  assert.equal(updater.calls.filter(([type]) => type === "check").length, 1);
+  reloaded.dispose();
+});
+
+test("pre-timestamp shared operations report unknown elapsed time until an explicit retry", () => {
+  const updater = nativeUpdater();
+  const first = create(updater, { now: () => 1791424800000 });
+  first.start();
+  // Model the live Symbol record from the previous installed controller version.
+  const record = updater[Symbol.for("claude-desktop-update-check.native-update.v1")];
+  delete record.startedAt;
+  delete record.state.startedAt;
+  updater.removeListener("update-available", record.listeners["update-available"]);
+  record.listeners["update-available"] = () => {
+    // The previous controller's event closure replaces state without new fields.
+    record.state = { phase: "downloading", supported: true, message: "正在下载更新…", version: null };
+    for (const lease of record.leases) if (lease.active) lease.onChange?.({ ...record.state });
+  };
+  updater.on("update-available", record.listeners["update-available"]);
+  first.dispose();
+  const changes = [];
+  let clockReads = 0;
+  const reloaded = create(updater, {
+    now() { clockReads++; return 1791424920000; },
+    onChange: (state) => changes.push(state.startedAt),
+  });
+  assert.equal(reloaded.getState().startedAt, null);
+  assert.equal(reloaded.start().startedAt, null);
+  updater.emit("update-available");
+  updater.emit("error", new Error("Retry required"));
+  assert.deepEqual(changes, [null, null]);
+  assert.equal(clockReads, 0);
+  assert.equal(reloaded.start().startedAt, 1791424920000);
+  assert.equal(clockReads, 1);
+  updater.emit("update-available");
+  assert.equal(reloaded.getState().startedAt, 1791424920000);
+  assert.deepEqual(changes, [null, null, 1791424920000, 1791424920000]);
+  updater.emit("update-not-available");
+  reloaded.dispose();
+});
+
+test("synchronous start failures keep the timestamp of each explicit attempt", () => {
+  const updater = nativeUpdater();
+  const changes = [];
+  const times = [1791424800000, 1791424860000];
+  const controller = create(updater, {
+    now: () => times.shift(),
+    getDeviceId() { throw new Error("Storage unavailable"); },
+    onChange: (state) => changes.push(state.startedAt),
+  });
+  assert.equal(controller.start().startedAt, 1791424800000);
+  assert.equal(controller.start().startedAt, 1791424860000);
+  assert.deepEqual(changes, [1791424800000, 1791424860000]);
+  assert.deepEqual(updater.calls, []);
+  controller.dispose();
+});

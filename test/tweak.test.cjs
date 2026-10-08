@@ -70,6 +70,12 @@ class Element {
     this.listeners.get(name)?.delete(handler);
   }
 
+  animate(keyframes, options) {
+    const animation = { keyframes, options, cancelled: false, cancel() { this.cancelled = true; } };
+    this.ownerDocument.animations.push(animation);
+    return animation;
+  }
+
   async click() {
     if (this.disabled) return;
     const event = { preventDefault() {}, stopPropagation() {} };
@@ -77,8 +83,12 @@ class Element {
   }
 }
 
-function documentFixture() {
-  const document = { createElement: (tag) => new Element(tag, document) };
+function documentFixture(reducedMotion = false) {
+  const document = {
+    createElement: (tag) => new Element(tag, document),
+    animations: [],
+    defaultView: { matchMedia: () => ({ matches: reducedMotion }) },
+  };
   return document;
 }
 
@@ -109,15 +119,38 @@ function loadTweak(globals = {}) {
   return context.module.exports;
 }
 
-const idleNativeState = { phase: 'idle', supported: true, message: null, version: null };
+function fakeClock(now = Date.now()) {
+  let nextId = 0;
+  const intervals = new Map();
+  return {
+    Date: { now: () => now },
+    setInterval(callback, delay) { intervals.set(++nextId, { callback, delay, nextAt: now + delay }); return nextId; },
+    clearInterval(id) { intervals.delete(id); },
+    activeIntervals: () => intervals.size,
+    advance(duration) {
+      const target = now + duration;
+      while (true) {
+        const due = [...intervals.values()].filter((timer) => timer.nextAt <= target).sort((a, b) => a.nextAt - b.nextAt)[0];
+        if (!due) break;
+        now = due.nextAt;
+        due.nextAt += due.delay;
+        due.callback();
+      }
+      now = target;
+    },
+  };
+}
 
-function rendererFixture(invoke, readState = async () => idleNativeState) {
-  const document = documentFixture();
+const idleNativeState = { phase: 'idle', supported: true, message: null, version: null, startedAt: null };
+
+function rendererFixture(invoke, readState = async () => idleNativeState, options = {}) {
+  const document = documentFixture(options.reducedMotion);
+  const clock = options.clock ?? fakeClock();
   const root = document.createElement('div');
   const registrations = [];
   const subscriptions = new Map();
   let unregisterCount = 0;
-  const tweak = loadTweak({ document });
+  const tweak = loadTweak({ document, Date: clock.Date, setInterval: clock.setInterval, clearInterval: clock.clearInterval });
   const api = {
     process: 'renderer',
     ipc: {
@@ -137,7 +170,7 @@ function rendererFixture(invoke, readState = async () => idleNativeState) {
   };
   tweak.start(api);
   return {
-    tweak, root, registrations, subscriptions, unregisterCount: () => unregisterCount,
+    tweak, root, registrations, subscriptions, clock, unregisterCount: () => unregisterCount,
     emit(state) { for (const listener of subscriptions.get('native-update-state') ?? []) listener(state); },
   };
 }
@@ -163,6 +196,8 @@ test('renderer starts without Node require and reads only local version and nati
   assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON').textContent, '检查更新（不下载）');
   assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude').disabled, true);
   assert.equal(find(fixture.root, (node) => node.getAttribute('role') === 'status').getAttribute('aria-live'), 'polite');
+  assert.equal(fixture.clock.activeIntervals(), 0);
+  assert.equal(fixture.root.ownerDocument.animations.length, 0);
   cleanup();
 });
 
@@ -293,6 +328,7 @@ function mainFixture(request, values = new Map(), options = {}) {
   const nativeCalls = [];
   const messages = [];
   const dialogs = [];
+  const externalUrls = [];
   const autoUpdater = new EventEmitter();
   autoUpdater.setFeedURL = (options) => nativeCalls.push({ method: 'setFeedURL', options });
   autoUpdater.checkForUpdates = () => { nativeCalls.push({ method: 'checkForUpdates' }); return options.nativeCheck?.(); };
@@ -311,6 +347,7 @@ function mainFixture(request, values = new Map(), options = {}) {
     require: (name) => name === 'electron' ? {
       app: { getVersion: () => '2.26454.2.0' }, net, autoUpdater,
       dialog: { showMessageBox(dialogOptions) { dialogs.push(dialogOptions); return options.confirm?.() ?? Promise.resolve({ response: 0 }); } },
+      shell: { openExternal(url) { externalUrls.push(url); return options.openExternal?.(url) ?? Promise.resolve(); } },
     } : nodeRequire(name),
   });
   const api = {
@@ -326,7 +363,7 @@ function mainFixture(request, values = new Map(), options = {}) {
     log: { info(...args) { logs.push(args); } },
   };
   tweak.start(api);
-  return { tweak, handlers, calls, storageReads, storageWrites, values, logs, nativeCalls, messages, dialogs, autoUpdater };
+  return { tweak, handlers, calls, storageReads, storageWrites, values, logs, nativeCalls, messages, dialogs, autoUpdater, externalUrls };
 }
 
 function mainHandler(fixture, channel) {
@@ -345,6 +382,7 @@ test('Main startup and local version reads never query the network or create an 
   assert.deepEqual(fixture.storageReads, []);
   assert.deepEqual(fixture.storageWrites, []);
   assert.deepEqual(fixture.nativeCalls, []);
+  assert.deepEqual(fixture.externalUrls, []);
   assert.match(fixture.logs.flat().join(' '), /2\.26454\.2\.0/);
   fixture.tweak.stop();
 });
@@ -356,6 +394,7 @@ test('an explicit Main check creates one synthetic identity and reuses it across
   assert.equal(result.latestVersion, '2.30000.0');
   assert.equal(result.updateAvailable, true);
   assert.equal(fixture.calls.length, 1);
+  assert.deepEqual(fixture.externalUrls, [], 'Metadata checks must not open the release notes page');
   assert.equal(fixture.storageWrites.length, 1);
   const [key, identity] = fixture.storageWrites[0];
   assert.equal(key, 'deviceId');
@@ -451,7 +490,7 @@ test('the official placeholder for empty release notes is explained without inve
   await settle();
   await find(fixture.root, (node) => node.tagName === 'BUTTON').click();
   assert.match(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /当前版本无需更新/);
-  assert.equal(find(fixture.root, (node) => node.tagName === 'PRE').textContent, '官方接口未提供详细更新说明。');
+  assert.equal(find(fixture.root, (node) => node.tagName === 'PRE').textContent, '此版本接口未提供详细更新说明。');
   fixture.tweak.stop();
 });
 
@@ -477,16 +516,17 @@ test('only an explicit update click starts native work and native events keep bo
   assert.match(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /检查|查询/);
   fixture.emit({ ...idleNativeState, phase: 'downloading' });
   assert.match(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /下载/);
-  const progress = find(fixture.root, (node) => node.tagName === 'PROGRESS');
-  assert.equal(progress.hidden, false);
-  assert.equal(progress.getAttribute('value'), null, 'No percentage is invented for native events');
+  const activity = find(fixture.root, (node) => node.getAttribute('aria-label') === '原生更新活动');
+  assert.equal(activity.hidden, false);
+  assert.equal(descendants(fixture.root).some((node) => node.tagName === 'PROGRESS' || node.getAttribute('aria-valuenow') !== null), false);
+  assert.match(fixture.root.textContent, /原生更新器不提供百分比/);
   await check.click();
   await update.click();
   assert.equal(calls.length, 3);
   fixture.emit({ ...idleNativeState, phase: 'ready', version: '2.30000.0' });
   assert.equal(update.textContent, '重启安装');
   assert.equal(update.disabled, false);
-  assert.equal(progress.hidden, true);
+  assert.equal(activity.hidden, true);
   fixture.tweak.stop();
 });
 
@@ -843,5 +883,199 @@ test('Main cancel keeps downloaded state and explicit confirmation calls install
   assert.equal(mainHandler(fixture, 'get-native-update-state')().phase, 'restarting');
   assert.equal(fixture.dialogs.length, 2);
   assert.equal(fixture.nativeCalls.filter((call) => call.method === 'quitAndInstall').length, 1);
+  fixture.tweak.stop();
+});
+
+test('download activity animates and waiting time ticks from the Main start time without a made-up percentage', async () => {
+  const clock = fakeClock(100_000);
+  const calls = [];
+  const fixture = rendererFixture(async (channel) => { calls.push(channel); return '2.26454.2.0'; }, async () => ({
+    ...idleNativeState, phase: 'checking', startedAt: 90_000,
+  }), { clock });
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  const activity = find(fixture.root, (node) => node.getAttribute('aria-label') === '原生更新活动');
+  const elapsed = find(activity, (node) => node.getAttribute('aria-label') === '更新等待时长');
+  const status = find(fixture.root, (node) => node.getAttribute('role') === 'status');
+  assert.equal(activity.hidden, false);
+  assert.doesNotMatch(activity.style.cssText, /(?:^|;)\s*display\s*:/i, 'Inline display must not override the hidden attribute');
+  assert.match(elapsed.textContent, /10 秒/);
+  assert.equal(elapsed.getAttribute('aria-live'), 'off');
+  assert.equal(clock.activeIntervals(), 1);
+  const animation = fixture.root.ownerDocument.animations[0];
+  assert.ok(animation);
+  assert.notEqual(animation.keyframes[0].transform, animation.keyframes.at(-1).transform);
+  assert.equal(animation.options.iterations, Infinity);
+  clock.advance(1000);
+  assert.match(elapsed.textContent, /11 秒/);
+  fixture.emit({ ...idleNativeState, phase: 'downloading', startedAt: 90_000 });
+  assert.match(status.textContent, /Windows 正在下载并准备更新/);
+  assert.match(fixture.root.textContent, /原生更新器不提供百分比/);
+  assert.equal(fixture.root.ownerDocument.animations.length, 1);
+  assert.equal(clock.activeIntervals(), 1);
+  assert.equal(descendants(fixture.root).some((node) => node.tagName === 'PROGRESS' || node.getAttribute('aria-valuenow') !== null), false);
+  const stage = status.textContent;
+  clock.advance(109_000);
+  assert.equal(status.textContent, stage, 'Elapsed time does not trigger per-second live announcements');
+  assert.match(elapsed.textContent, /120 秒/);
+  assert.match(activity.textContent, /尚未收到完成或错误反馈，无法判断是否停滞/);
+  assert.deepEqual(calls, ['get-version'], 'A long wait never retries or initiates work');
+  fixture.emit({ ...idleNativeState, phase: 'ready', startedAt: 90_000 });
+  assert.equal(activity.hidden, true);
+  assert.equal(clock.activeIntervals(), 0);
+  assert.equal(animation.cancelled, true);
+  fixture.tweak.stop();
+});
+
+test('reopening a download uses its original start time and unknown start time remains unknown', async () => {
+  const clock = fakeClock(500_000);
+  const restored = { ...idleNativeState, phase: 'downloading', startedAt: 420_000 };
+  const fixture = rendererFixture(async () => '2.26454.2.0', async () => restored, { clock });
+  const cleanup = fixture.registrations[0].render(fixture.root);
+  await settle();
+  assert.match(fixture.root.textContent, /80 秒/);
+  cleanup();
+  assert.equal(clock.activeIntervals(), 0);
+  clock.advance(5000);
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  assert.match(fixture.root.textContent, /85 秒/);
+  fixture.emit({ ...restored, startedAt: null });
+  const elapsed = find(fixture.root, (node) => node.getAttribute('aria-label') === '更新等待时长');
+  assert.match(elapsed.textContent, /无法获取开始时间/);
+  clock.advance(200_000);
+  assert.match(elapsed.textContent, /无法获取开始时间/);
+  assert.doesNotMatch(fixture.root.textContent, /无法判断是否停滞/);
+  fixture.tweak.stop();
+  assert.equal(clock.activeIntervals(), 0);
+  assert.ok(fixture.root.ownerDocument.animations.every((animation) => animation.cancelled));
+});
+
+test('terminal states and cleanup stop activity while restarting does not count time spent ready', async () => {
+  const clock = fakeClock(10_000_000);
+  const fixture = rendererFixture(async () => '2.26454.2.0', async () => idleNativeState, { clock });
+  const cleanup = fixture.registrations[0].render(fixture.root);
+  await settle();
+  const activity = find(fixture.root, (node) => node.getAttribute('aria-label') === '原生更新活动');
+  for (const phase of ['confirming', 'ready', 'error', 'idle', 'unavailable']) {
+    fixture.emit({ ...idleNativeState, phase: 'downloading', startedAt: 0 });
+    assert.equal(clock.activeIntervals(), 1);
+    fixture.emit({ ...idleNativeState, phase, startedAt: 0 });
+    assert.equal(activity.hidden, true);
+    assert.equal(clock.activeIntervals(), 0);
+    assert.equal(fixture.root.ownerDocument.animations.at(-1).cancelled, true);
+  }
+  fixture.emit({ ...idleNativeState, phase: 'restarting', startedAt: 0 });
+  assert.equal(activity.hidden, false);
+  assert.equal(clock.activeIntervals(), 0);
+  assert.doesNotMatch(activity.textContent, /秒|无法判断是否停滞/);
+  assert.equal(fixture.root.ownerDocument.animations.at(-1).cancelled, false);
+  cleanup();
+  assert.equal(fixture.root.ownerDocument.animations.at(-1).cancelled, true);
+  fixture.emit({ ...idleNativeState, phase: 'downloading', startedAt: 0 });
+  assert.equal(clock.activeIntervals(), 0);
+  fixture.tweak.stop();
+});
+
+test('reduced motion suppresses moving activity while elapsed time still updates', async () => {
+  const clock = fakeClock(50_000);
+  const fixture = rendererFixture(async () => '2.26454.2.0', async () => ({
+    ...idleNativeState, phase: 'downloading', startedAt: 40_000,
+  }), { clock, reducedMotion: true });
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  assert.equal(fixture.root.ownerDocument.animations.length, 0);
+  assert.match(fixture.root.textContent, /10 秒/);
+  clock.advance(1000);
+  assert.match(fixture.root.textContent, /11 秒/);
+  fixture.tweak.stop();
+  assert.equal(clock.activeIntervals(), 0);
+});
+
+for (const releaseNotes of [null, '', '  \n\t', 'Production Release - No Notes', '  production RELEASE - NO notes  ']) {
+  test(`a successful version result explains missing detailed notes: ${JSON.stringify(releaseNotes)}`, async () => {
+    const calls = [];
+    const fixture = rendererFixture(async (channel) => {
+      calls.push(channel);
+      return channel === 'get-version' ? '2.26454.2.0' : {
+        currentVersion: '2.26454.2.0', latestVersion: '2.30000.0', updateAvailable: true, releaseNotes,
+      };
+    });
+    fixture.registrations[0].render(fixture.root);
+    await settle();
+    await find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新')).click();
+    const notes = find(fixture.root, (node) => node.tagName === 'PRE');
+    assert.equal(notes.parentNode.hidden, false);
+    assert.equal(notes.textContent, '此版本接口未提供详细更新说明。');
+    assert.match(fixture.root.textContent, /产品整体.*安装包/);
+    assert.deepEqual(calls, ['get-version', 'check-update']);
+    fixture.tweak.stop();
+  });
+}
+
+test('the official notes action opens only on click and shows failure without changing update status', async () => {
+  const calls = [];
+  const opened = deferred();
+  const fixture = rendererFixture(async (channel) => {
+    calls.push(channel);
+    if (channel === 'get-version') return '2.26454.2.0';
+    assert.equal(channel, 'open-release-notes');
+    return opened.promise;
+  });
+  const cleanup = fixture.registrations[0].render(fixture.root);
+  await settle();
+  assert.deepEqual(calls, ['get-version']);
+  const button = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '查看官方产品更新记录');
+  const nativeStatus = find(fixture.root, (node) => node.getAttribute('role') === 'status');
+  const before = nativeStatus.textContent;
+  const click = button.click();
+  assert.equal(button.disabled, true);
+  await button.click();
+  opened.reject(new Error('<script>External blocked</script>'));
+  await click;
+  assert.deepEqual(calls, ['get-version', 'open-release-notes']);
+  assert.equal(button.disabled, false);
+  assert.match(fixture.root.textContent, /无法打开官方产品更新记录/);
+  assert.equal(nativeStatus.textContent, before);
+  cleanup();
+  assert.equal(button.listeners.get('click').size, 0);
+  assert.equal(fixture.root.children.length, 0);
+  fixture.tweak.stop();
+});
+
+test('unmount ignores a late official notes error and releases its click listener', async () => {
+  const opened = deferred();
+  const fixture = rendererFixture(async (channel) => channel === 'get-version' ? '2.26454.2.0' : opened.promise);
+  const cleanup = fixture.registrations[0].render(fixture.root);
+  await settle();
+  const button = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '查看官方产品更新记录');
+  const click = button.click();
+  cleanup();
+  opened.reject(new Error('Too late'));
+  await click;
+  assert.equal(button.listeners.get('click').size, 0);
+  assert.equal(fixture.root.children.length, 0);
+  fixture.tweak.stop();
+});
+
+test('Main official notes handler ignores caller URLs and opens only the fixed product release notes URL', async () => {
+  const fixture = mainFixture(() => { throw new Error('No network expected'); });
+  const open = mainHandler(fixture, 'open-release-notes');
+  assert.deepEqual(fixture.externalUrls, []);
+  await open('https://example.invalid/attacker');
+  assert.deepEqual(fixture.externalUrls, ['https://support.claude.com/en/articles/12138966-release-notes']);
+  assert.deepEqual(fixture.calls, []);
+  assert.deepEqual(fixture.nativeCalls, []);
+  assert.deepEqual(fixture.storageReads, []);
+  fixture.tweak.stop();
+  assert.throws(() => open(), /stopped|停止|停用/i);
+  assert.equal(fixture.externalUrls.length, 1);
+});
+
+test('Main official notes handler propagates a browser launch failure to its caller', async () => {
+  const fixture = mainFixture(() => { throw new Error('No network expected'); }, new Map(), {
+    openExternal: async () => { throw new Error('Browser launch failed'); },
+  });
+  await assert.rejects(mainHandler(fixture, 'open-release-notes')(), /Browser launch failed/);
   fixture.tweak.stop();
 });

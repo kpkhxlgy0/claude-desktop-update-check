@@ -9,7 +9,7 @@ function createNativeUpdateController(options) {
     (options.arch === "x64" || options.arch === "arm64") && updater &&
     ["setFeedURL", "checkForUpdates", "quitAndInstall", "on", "removeListener"]
       .every((method) => typeof updater[method] === "function");
-  const lease = { active: true, onChange: options.onChange };
+  const lease = { active: true, onChange: null };
   const unavailable = {
     phase: "unavailable", supported: false,
     message: "当前环境无法使用 Claude 的 Windows MSIX 更新程序。", version: null,
@@ -20,7 +20,7 @@ function createNativeUpdateController(options) {
     if (!record) {
       record = {
         updater, state: { phase: "idle", supported: true, message: null, version: null },
-        leases: new Set(), listeners: null, generation: 0,
+        leases: new Set(), listeners: null, generation: 0, startedAt: null,
         confirmation: null, installAttempted: false,
       };
       Object.defineProperty(updater, SHARED_UPDATE, { value: record });
@@ -28,17 +28,21 @@ function createNativeUpdateController(options) {
     record.leases.add(lease);
   }
 
-  const getState = () => ({ ...(record?.state ?? unavailable) });
+  // Keep the time outside state: observers retained from older versions replace state.
+  const getState = () => ({ ...(record?.state ?? unavailable), startedAt: record?.startedAt ?? null });
+  if (typeof options.onChange === "function") lease.onChange = () => options.onChange(getState());
 
   function start() {
     if (!lease.active || !record) return getState();
     if (["checking", "downloading", "ready", "confirming", "restarting"].includes(record.state.phase)) return getState();
     const generation = ++record.generation;
     record.installAttempted = false;
+    let startedAt = null;
     try {
+      startedAt = (options.now ?? Date.now)();
       const url = buildFeedURL(options);
       attach(record);
-      update(record, "checking", "正在调用 Claude 更新程序…", null);
+      update(record, "checking", "正在调用 Claude 更新程序…", null, startedAt);
       const result = updater.setFeedURL({ url, serverType: "json" });
       const check = () => {
         if (record.generation !== generation || record.state.phase !== "checking") return;
@@ -53,7 +57,7 @@ function createNativeUpdateController(options) {
         check();
       }
     } catch (error) {
-      fail(record, error, generation);
+      fail(record, error, generation, startedAt);
     }
     return getState();
   }
@@ -123,8 +127,10 @@ function buildFeedURL(options) {
   return url.href;
 }
 
-function update(record, phase, message, version = record.state.version) {
-  if (record.state.phase === phase && record.state.message === message && record.state.version === version) return;
+function update(record, phase, message, version = record.state.version, startedAt = record.startedAt ?? null) {
+  if (record.state.phase === phase && record.state.message === message && record.state.version === version &&
+    (record.startedAt ?? null) === startedAt) return;
+  record.startedAt = startedAt;
   record.state = { phase, supported: true, message, version };
   for (const lease of [...record.leases]) {
     if (!lease.active || typeof lease.onChange !== "function") continue;
@@ -133,9 +139,9 @@ function update(record, phase, message, version = record.state.version) {
   detachIfUnused(record);
 }
 
-function fail(record, error, generation) {
+function fail(record, error, generation, startedAt = record.startedAt ?? null) {
   if (record.generation !== generation) return;
-  update(record, "error", `Claude 更新失败：${String(error?.message ?? error)}`);
+  update(record, "error", `Claude 更新失败：${String(error?.message ?? error)}`, record.state.version, startedAt);
 }
 
 function attach(record) {

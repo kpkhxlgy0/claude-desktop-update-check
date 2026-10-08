@@ -3,7 +3,7 @@ let mainState = null;
 const activeViews = new Set();
 
 function startMain(api) {
-  const { app, net, autoUpdater, dialog } = require('electron');
+  const { app, net, autoUpdater, dialog, shell } = require('electron');
   const os = require('node:os');
   const { randomUUID } = require('node:crypto');
   const { checkClaudeDesktopUpdate } = require('./update-check.cjs');
@@ -103,6 +103,10 @@ function startMain(api) {
     void state.native.restart();
     return state.native.getState();
   });
+  api.ipc.handle('open-release-notes', () => {
+    ensureActive();
+    return shell.openExternal('https://support.claude.com/en/articles/12138966-release-notes');
+  });
   api.log.info('Claude 更新检查已启动', `当前版本 ${app.getVersion()}`);
   const native = state.native.getState();
   api.log.info('Claude 原生更新能力', `supported=${native.supported} phase=${native.phase} platform=${process.platform} windowsStore=${process.windowsStore === true} electron=${process.versions?.electron ?? '未知'}`);
@@ -116,9 +120,12 @@ function renderPage(api, root) {
   let updateAvailable = false;
   let nativePending = false;
   let nativeRevision = 0;
-  let nativeState = { phase: 'idle', supported: false, message: null, version: null };
+  let nativeState = { phase: 'idle', supported: false, message: null, version: null, startedAt: null };
   let showNativeTerminalMessage = true;
   let metadataStatus = '点击检查按钮查询官方版本信息。';
+  let waitingTimer = null;
+  let activityAnimation = null;
+  const reducedMotion = document.defaultView?.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true;
 
   const page = document.createElement('section');
   page.style.cssText = 'display:flex;flex-direction:column;gap:16px;max-width:620px;color:inherit;';
@@ -163,11 +170,28 @@ function renderPage(api, root) {
   status.style.cssText = 'margin:0;font-size:13px;';
   page.appendChild(status);
 
-  const progress = document.createElement('progress');
-  progress.hidden = true;
-  progress.setAttribute('aria-label', 'Claude 更新进度');
-  progress.style.cssText = 'width:100%;max-width:360px;';
-  page.appendChild(progress);
+  const activity = document.createElement('div');
+  activity.hidden = true;
+  activity.setAttribute('aria-label', '原生更新活动');
+  activity.style.cssText = 'width:100%;max-width:360px;';
+  const activityTrack = document.createElement('div');
+  activityTrack.setAttribute('aria-hidden', 'true');
+  activityTrack.style.cssText = 'height:8px;overflow:hidden;border-radius:4px;background:rgba(127,127,127,.2);';
+  const activityBar = document.createElement('span');
+  activityBar.style.cssText = 'display:block;width:35%;height:100%;border-radius:4px;background:currentColor;opacity:.7;';
+  activityTrack.appendChild(activityBar);
+  const activityExplanation = document.createElement('p');
+  activityExplanation.textContent = '原生更新器不提供百分比；活动条仅表示等待原生反馈。';
+  activityExplanation.style.cssText = 'margin:8px 0 0;font-size:13px;opacity:.75;';
+  const elapsed = document.createElement('p');
+  elapsed.setAttribute('aria-label', '更新等待时长');
+  elapsed.setAttribute('aria-live', 'off');
+  elapsed.style.cssText = 'margin:8px 0 0;font-size:13px;';
+  const longWait = document.createElement('p');
+  longWait.setAttribute('aria-live', 'off');
+  longWait.style.cssText = 'margin:8px 0 0;font-size:13px;';
+  activity.append(activityTrack, activityExplanation, elapsed, longWait);
+  page.appendChild(activity);
 
   const notesSection = document.createElement('section');
   notesSection.hidden = true;
@@ -178,7 +202,64 @@ function renderPage(api, root) {
   notes.style.cssText = 'margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:13px;line-height:1.6;';
   notesSection.append(notesHeading, notes);
   page.appendChild(notesSection);
+
+  const productNotes = document.createElement('section');
+  const productNotesDescription = document.createElement('p');
+  productNotesDescription.textContent = '官方更新记录覆盖 Claude 产品整体，不与安装包版本逐一对应。';
+  productNotesDescription.style.cssText = 'margin:0 0 8px;font-size:13px;opacity:.75;';
+  const notesButton = document.createElement('button');
+  notesButton.type = 'button';
+  notesButton.textContent = '查看官方产品更新记录';
+  notesButton.style.cssText = button.style.cssText;
+  const notesStatus = document.createElement('p');
+  notesStatus.setAttribute('role', 'status');
+  notesStatus.setAttribute('aria-live', 'polite');
+  notesStatus.style.cssText = 'margin:8px 0 0;font-size:13px;';
+  notesStatus.hidden = true;
+  productNotes.append(productNotesDescription, notesButton, notesStatus);
+  page.appendChild(productNotes);
   root.appendChild(page);
+
+  function renderWaitingTime() {
+    const now = Date.now();
+    const startedAt = nativeState.startedAt;
+    if (typeof startedAt !== 'number' || !Number.isFinite(startedAt) || startedAt > now) {
+      elapsed.textContent = '无法获取开始时间。';
+      longWait.textContent = '';
+      longWait.hidden = true;
+      return;
+    }
+    const seconds = Math.floor((now - startedAt) / 1000);
+    elapsed.textContent = `更新操作已等待 ${seconds} 秒。`;
+    longWait.textContent = seconds >= 120 ? '尚未收到完成或错误反馈，无法判断是否停滞。' : '';
+    longWait.hidden = seconds < 120;
+  }
+  function syncActivity() {
+    const animated = ['checking', 'downloading', 'restarting'].includes(nativeState.phase);
+    const waiting = ['checking', 'downloading'].includes(nativeState.phase);
+    activity.hidden = !animated;
+    activityExplanation.hidden = !waiting;
+    elapsed.hidden = !waiting;
+    longWait.hidden = !waiting;
+    if (animated && !activityAnimation && !reducedMotion && typeof activityBar.animate === 'function') {
+      activityAnimation = activityBar.animate([
+        { transform: 'translateX(-100%)' },
+        { transform: 'translateX(385%)' },
+      ], { duration: 1200, iterations: Infinity });
+    } else if (!animated && activityAnimation) {
+      activityAnimation.cancel();
+      activityAnimation = null;
+    }
+    if (waiting) {
+      renderWaitingTime();
+      if (waitingTimer === null) waitingTimer = setInterval(renderWaitingTime, 1000);
+    } else {
+      if (waitingTimer !== null) clearInterval(waitingTimer);
+      waitingTimer = null;
+      elapsed.textContent = '';
+      longWait.textContent = '';
+    }
+  }
 
   function refresh() {
     const nativeBusy = ['checking', 'downloading', 'confirming', 'restarting'].includes(nativeState.phase);
@@ -186,11 +267,11 @@ function renderPage(api, root) {
     updateButton.textContent = ['ready', 'confirming'].includes(nativeState.phase) ? '重启安装' : '更新 Claude';
     updateButton.disabled = busy || nativePending || nativeBusy || !nativeState.supported ||
       (nativeState.phase !== 'ready' && !updateAvailable);
-    progress.hidden = !['checking', 'downloading'].includes(nativeState.phase);
+    syncActivity();
     status.setAttribute('aria-busy', String(busy || nativePending || nativeBusy));
     const messages = {
       checking: '原生更新器正在检查并准备下载…',
-      downloading: '正在下载 Claude 更新…',
+      downloading: 'Windows 正在下载并准备更新…',
       ready: `更新已下载${nativeState.version ? `（${nativeState.version}）` : ''}。点击“重启安装”后确认安装。`,
       confirming: '请在确认对话框中选择是否重启安装。',
       restarting: '正在重启 Claude 并安装更新…',
@@ -236,10 +317,12 @@ function renderPage(api, root) {
       metadataStatus = result.latestVersion === null
         ? '官方接口未返回新版信息'
         : result.updateAvailable ? '发现新版本。' : '当前版本无需更新。';
-      if (result.releaseNotes) {
-        notes.textContent = result.releaseNotes === 'Production Release - No Notes'
-          ? '官方接口未提供详细更新说明。'
-          : result.releaseNotes;
+      if (result.latestVersion !== null) {
+        const releaseNotes = typeof result.releaseNotes === 'string' ? result.releaseNotes : '';
+        const normalizedNotes = releaseNotes.trim();
+        notes.textContent = !normalizedNotes || /^Production Release - No Notes$/i.test(normalizedNotes)
+          ? '此版本接口未提供详细更新说明。'
+          : releaseNotes;
         notesSection.hidden = false;
       }
     } catch (error) {
@@ -279,6 +362,26 @@ function renderPage(api, root) {
   }
   updateButton.addEventListener('click', update);
 
+  async function openNotes(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!active || notesButton.disabled) return;
+    notesButton.disabled = true;
+    notesStatus.textContent = '';
+    notesStatus.hidden = true;
+    try {
+      await api.ipc.invoke('open-release-notes');
+    } catch {
+      if (active) {
+        notesStatus.textContent = '无法打开官方产品更新记录，请稍后重试。';
+        notesStatus.hidden = false;
+      }
+    } finally {
+      if (active) notesButton.disabled = false;
+    }
+  }
+  notesButton.addEventListener('click', openNotes);
+
   Promise.resolve().then(() => api.ipc.invoke('get-version')).then((version) => {
     if (active) currentVersion.textContent = version;
   }).catch(() => {
@@ -304,6 +407,11 @@ function renderPage(api, root) {
     active = false;
     button.removeEventListener('click', check);
     updateButton.removeEventListener('click', update);
+    notesButton.removeEventListener('click', openNotes);
+    if (waitingTimer !== null) clearInterval(waitingTimer);
+    waitingTimer = null;
+    activityAnimation?.cancel();
+    activityAnimation = null;
     unsubscribe();
     page.remove();
     activeViews.delete(cleanup);
