@@ -123,7 +123,9 @@ function renderPage(api, root) {
   let nativeState = { phase: 'idle', supported: false, message: null, version: null, startedAt: null };
   let showNativeTerminalMessage = true;
   let metadataStatus = '点击检查按钮查询官方版本信息。';
-  let waitingTimer = null;
+  let stateTimer = null;
+  let stateReadPending = false;
+  let nextStateReadAt = 0;
   let activityAnimation = null;
   const reducedMotion = document.defaultView?.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true;
 
@@ -252,12 +254,36 @@ function renderPage(api, root) {
     }
     if (waiting) {
       renderWaitingTime();
-      if (waitingTimer === null) waitingTimer = setInterval(renderWaitingTime, 1000);
     } else {
-      if (waitingTimer !== null) clearInterval(waitingTimer);
-      waitingTimer = null;
       elapsed.textContent = '';
       longWait.textContent = '';
+    }
+    if (['checking', 'downloading', 'confirming', 'restarting'].includes(nativeState.phase)) {
+      if (stateTimer === null) {
+        nextStateReadAt = Date.now() + 5000;
+        stateTimer = setInterval(() => {
+          if (['checking', 'downloading'].includes(nativeState.phase)) renderWaitingTime();
+          if (Date.now() >= nextStateReadAt) void reconcileNativeState();
+        }, 1000);
+      }
+    } else {
+      if (stateTimer !== null) clearInterval(stateTimer);
+      stateTimer = null;
+    }
+  }
+
+  async function reconcileNativeState() {
+    if (!active || stateReadPending || nativePending || !['checking', 'downloading', 'confirming', 'restarting'].includes(nativeState.phase)) return;
+    const revision = nativeRevision;
+    stateReadPending = true;
+    nextStateReadAt = Date.now() + 5000;
+    try {
+      const snapshot = await api.ipc.invoke('get-native-update-state');
+      if (active && nativeRevision === revision && !nativePending) applyNativeState(snapshot);
+    } catch {
+      // A missed broadcast or failed local read must not start another download.
+    } finally {
+      stateReadPending = false;
     }
   }
 
@@ -408,8 +434,8 @@ function renderPage(api, root) {
     button.removeEventListener('click', check);
     updateButton.removeEventListener('click', update);
     notesButton.removeEventListener('click', openNotes);
-    if (waitingTimer !== null) clearInterval(waitingTimer);
-    waitingTimer = null;
+    if (stateTimer !== null) clearInterval(stateTimer);
+    stateTimer = null;
     activityAnimation?.cancel();
     activityAnimation = null;
     unsubscribe();

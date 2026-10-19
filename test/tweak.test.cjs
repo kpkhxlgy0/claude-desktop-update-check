@@ -530,6 +530,134 @@ test('only an explicit update click starts native work and native events keep bo
   fixture.tweak.stop();
 });
 
+test('a waiting page recovers download completion when native broadcasts are lost', async () => {
+  const main = mainFixture(async () => feedResponse());
+  const fixture = rendererFixture(
+    async (channel) => mainHandler(main, channel)(),
+    async () => mainHandler(main, 'get-native-update-state')(),
+  );
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  await find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新')).click();
+  const update = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '更新 Claude');
+  await update.click();
+  assert.equal(update.disabled, true);
+
+  // Exercise both real Tweak halves, without delivering Main's IPC broadcasts.
+  main.autoUpdater.emit('update-available');
+  main.autoUpdater.emit('update-downloaded', {}, '', 'Claude 2.30000.0');
+  assert.equal(mainHandler(main, 'get-native-update-state')().phase, 'ready');
+  fixture.clock.advance(5000);
+  await settle();
+
+  assert.equal(update.textContent, '重启安装');
+  assert.equal(update.disabled, false);
+  assert.match(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /更新已下载.*2\.30000\.0/);
+  assert.equal(find(fixture.root, (node) => node.getAttribute('aria-label') === '原生更新活动').hidden, true);
+  assert.equal(fixture.clock.activeIntervals(), 0);
+  assert.equal(main.calls.length, 1, 'Reconciliation must not check the network again');
+  assert.deepEqual(main.nativeCalls.map((call) => call.method), ['setFeedURL', 'checkForUpdates']);
+  fixture.tweak.stop();
+  main.tweak.stop();
+});
+
+test('waiting state reads are single flight and cannot overwrite a newer completion event', async () => {
+  const pending = deferred();
+  let reads = 0;
+  const checking = { ...idleNativeState, phase: 'checking', startedAt: Date.now() };
+  const fixture = rendererFixture(async () => '2.26454.2.0', () => ++reads === 1 ? Promise.resolve(checking) : pending.promise);
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  fixture.clock.advance(5000);
+  await settle();
+  assert.equal(reads, 2);
+  fixture.clock.advance(15000);
+  await settle();
+  assert.equal(reads, 2, 'A slow state read must not queue overlapping requests');
+  fixture.emit({ ...checking, phase: 'ready', version: '2.30000.0' });
+  pending.resolve(checking);
+  await settle();
+  assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '重启安装').disabled, false);
+  assert.equal(fixture.clock.activeIntervals(), 0);
+  fixture.tweak.stop();
+});
+
+test('a failed waiting state read retries locally and cleanup ignores an outstanding read', async () => {
+  const pending = deferred();
+  let reads = 0;
+  const checking = { ...idleNativeState, phase: 'checking', startedAt: Date.now() };
+  const fixture = rendererFixture(async () => '2.26454.2.0', async () => {
+    reads += 1;
+    if (reads === 1) return checking;
+    if (reads === 2) throw new Error('IPC temporarily unavailable');
+    return pending.promise;
+  });
+  const cleanup = fixture.registrations[0].render(fixture.root);
+  await settle();
+  fixture.clock.advance(5000);
+  await settle();
+  assert.equal(reads, 2);
+  assert.match(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /检查并准备下载/);
+  fixture.clock.advance(5000);
+  await settle();
+  assert.equal(reads, 3);
+  cleanup();
+  pending.resolve({ ...checking, phase: 'ready', version: '2.30000.0' });
+  await settle();
+  fixture.clock.advance(10000);
+  await settle();
+  assert.equal(reads, 3);
+  assert.equal(fixture.clock.activeIntervals(), 0);
+  assert.equal(fixture.root.children.length, 0);
+  fixture.tweak.stop();
+});
+
+test('lost cancellation broadcasts do not leave restart confirmation permanently disabled', async () => {
+  const confirmation = deferred();
+  const main = mainFixture(async () => feedResponse(), new Map(), { confirm: () => confirmation.promise });
+  await mainHandler(main, 'check-update')();
+  mainHandler(main, 'start-native-update')();
+  main.autoUpdater.emit('update-downloaded', {}, '', 'Claude 2.30000.0');
+  const fixture = rendererFixture(
+    async (channel) => mainHandler(main, channel)(),
+    async () => mainHandler(main, 'get-native-update-state')(),
+  );
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  const update = find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent === '重启安装');
+  await update.click();
+  assert.equal(update.disabled, true);
+  assert.match(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /确认对话框/);
+  assert.equal(find(fixture.root, (node) => node.getAttribute('aria-label') === '原生更新活动').hidden, true);
+  confirmation.resolve({ response: 0 });
+  await settle();
+  fixture.clock.advance(5000);
+  await settle();
+  assert.equal(update.disabled, false);
+  assert.match(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /更新已下载/);
+  assert.equal(fixture.clock.activeIntervals(), 0);
+  assert.deepEqual(main.nativeCalls.map((call) => call.method), ['setFeedURL', 'checkForUpdates']);
+  fixture.tweak.stop();
+  main.tweak.stop();
+});
+
+test('a lost install failure broadcast is recovered while the app remains running', async () => {
+  let state = { ...idleNativeState, phase: 'restarting' };
+  const fixture = rendererFixture(async (channel) => {
+    assert.equal(channel, 'get-version', 'Recovery must not retry installation');
+    return '2.26454.2.0';
+  }, async () => state);
+  fixture.registrations[0].render(fixture.root);
+  await settle();
+  state = { ...state, phase: 'error', message: '安装失败：文件被占用。' };
+  fixture.clock.advance(5000);
+  await settle();
+  assert.match(find(fixture.root, (node) => node.getAttribute('role') === 'status').textContent, /安装失败/);
+  assert.equal(find(fixture.root, (node) => node.tagName === 'BUTTON' && node.textContent.includes('检查更新')).disabled, false);
+  assert.equal(fixture.clock.activeIntervals(), 0);
+  fixture.tweak.stop();
+});
+
 test('a page opened after download offers only the explicit restart action', async () => {
   const calls = [];
   const ready = { ...idleNativeState, phase: 'ready', version: '2.30000.0' };
@@ -957,7 +1085,7 @@ test('terminal states and cleanup stop activity while restarting does not count 
   const cleanup = fixture.registrations[0].render(fixture.root);
   await settle();
   const activity = find(fixture.root, (node) => node.getAttribute('aria-label') === '原生更新活动');
-  for (const phase of ['confirming', 'ready', 'error', 'idle', 'unavailable']) {
+  for (const phase of ['ready', 'error', 'idle', 'unavailable']) {
     fixture.emit({ ...idleNativeState, phase: 'downloading', startedAt: 0 });
     assert.equal(clock.activeIntervals(), 1);
     fixture.emit({ ...idleNativeState, phase, startedAt: 0 });
@@ -967,7 +1095,7 @@ test('terminal states and cleanup stop activity while restarting does not count 
   }
   fixture.emit({ ...idleNativeState, phase: 'restarting', startedAt: 0 });
   assert.equal(activity.hidden, false);
-  assert.equal(clock.activeIntervals(), 0);
+  assert.equal(clock.activeIntervals(), 1, 'Keep reading local state in case installation fails');
   assert.doesNotMatch(activity.textContent, /秒|无法判断是否停滞/);
   assert.equal(fixture.root.ownerDocument.animations.at(-1).cancelled, false);
   cleanup();
